@@ -23,13 +23,22 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Load .env file if present (simple parser, no extra deps needed)
+const envPath = path.join(__dirname, "..", ".env.local");
+if (fs.existsSync(envPath)) {
+  for (const line of fs.readFileSync(envPath, "utf-8").split("\n")) {
+    const match = line.match(/^([A-Z_]+)=(.+)$/);
+    if (match) process.env[match[1]] ??= match[2].trim();
+  }
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 const IS_V2 = process.argv.includes("--v2");
-const BATCH_SIZE = 30; // stores per Claude API call
-const DELAY_MS = 1000; // delay between batches to respect rate limits
+const BATCH_SIZE = 50; // stores per Claude API call (~12 calls for 592 stores)
+const DELAY_MS = 500;  // delay between batches (ms)
 
 const INPUT_CSV = path.join(__dirname, "data", "looker-stores.csv");
 const OUTPUT_CSV = path.join(__dirname, "data", "enriched-stores.csv");
