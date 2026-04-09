@@ -1,0 +1,14 @@
+{
+  "name": "store-enricher",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "v1": "npx tsx enrich-stores.ts",
+    "v2": "npx tsx enrich-stores.ts --v2",
+    "sample": "npx tsx enrich-stores-sample.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  }
+}
