@@ -1,21 +1,22 @@
 /**
  * Store Location Enrichment Script — V1 + V2
  *
- * V1: Reads the Looker store CSV and calls Claude AI to extract per store:
+ * V1: Claude AI extrae por cada tienda:
  *   pais, ciudad, localidad, provincia, codigo_postal, shopping, es_digital, es_deposito
  *
- * V2 (--v2 flag): also queries Google Maps Places API to check Adidas/Puma presence at
- *   three granularities:
- *     ADI_shopping  / PUM_shopping  → Adidas/Puma inside that specific shopping (500 m)
- *     ADI_localidad / PUM_localidad → Adidas/Puma in that localidad/barrio     (2500 m)
- *     ADI_ciudad    / PUM_ciudad    → Adidas/Puma in that city/municipio       (8000 m)
- *   null = not applicable (digital/deposito/location unknown)
+ * V2 (--v2): Claude AI verifica si Adidas/Puma tienen tienda REAL en cada ubicación:
+ *   ADI_shopping  / PUM_shopping  → ¿hay tienda en ese shopping center puntual?
+ *   ADI_localidad / PUM_localidad → ¿hay tienda en esa localidad/barrio?
+ *   ADI_ciudad    / PUM_ciudad    → ¿hay tienda en esa ciudad/municipio?
+ *   null = no aplica (digital/depósito/ubicación desconocida)
+ *
+ * Todo con Claude API — no requiere Google Maps.
  *
  * Usage:
- *   npx tsx scripts/enrich-stores.ts          # V1 only
- *   npx tsx scripts/enrich-stores.ts --v2     # V1 + V2 competitor check
+ *   npx tsx scripts/enrich-stores.ts        # V1 solo
+ *   npx tsx scripts/enrich-stores.ts --v2   # V1 + V2
  *
- * Keys are loaded from .env.local in the project root.
+ * Keys: ANTHROPIC_API_KEY en .env.local
  * Output: scripts/data/enriched-stores.csv
  */
 
@@ -25,8 +26,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ─── Load .env.local ─────────────────────────────────────────────────────────
-
+// ─── Load .env.local ──────────────────────────────────────────────────────────
 const envPath = path.join(__dirname, "..", ".env.local");
 if (fs.existsSync(envPath)) {
   for (const line of fs.readFileSync(envPath, "utf-8").split("\n")) {
@@ -35,35 +35,24 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-// ─── Config ──────────────────────────────────────────────────────────────────
-
+// ─── Config ───────────────────────────────────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 const IS_V2 = process.argv.includes("--v2");
-const BATCH_SIZE = 50;
+const BATCH_SIZE = 50;       // tiendas por llamada Claude (Phase 1)
+const V2_BATCH_SIZE = 60;    // ubicaciones únicas por llamada Claude (Phase 2)
 const DELAY_MS = 500;
-
-// Search radii for competitor check
-const RADIUS_SHOPPING = 500;    // just the mall building
-const RADIUS_LOCALIDAD = 2500;  // neighborhood / localidad scale
-const RADIUS_CIUDAD = 8000;     // full city / municipio scale
 
 const INPUT_CSV = path.join(__dirname, "data", "looker-stores.csv");
 const OUTPUT_CSV = path.join(__dirname, "data", "enriched-stores.csv");
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-interface StoreInput {
-  sucursal: string;
-  canal: string;
-  cliente: string;
-}
+// ─── Types ────────────────────────────────────────────────────────────────────
+interface StoreInput { sucursal: string; canal: string; cliente: string }
 
 interface StoreLocation {
   sucursal: string;
-  pais: string;           // "AR" | "UY"
-  ciudad: string | null;  // municipio (Merlo, San Isidro, CABA, Esteban Echeverría)
-  localidad: string | null; // barrio/localidad (Flores, Monte Grande, Martínez, Grand Bourg)
+  pais: string;             // "AR" | "UY"
+  ciudad: string | null;    // municipio (La Matanza, San Isidro, CABA→"Buenos Aires")
+  localidad: string | null; // barrio/localidad (Flores, Monte Grande, Martínez)
   provincia: string | null;
   codigo_postal: string | null;
   shopping: string | null;
@@ -80,8 +69,7 @@ interface CompetitorFlags {
   PUM_ciudad: boolean | null;
 }
 
-// ─── CSV Helpers ─────────────────────────────────────────────────────────────
-
+// ─── CSV Helpers ──────────────────────────────────────────────────────────────
 function parseCSV(filePath: string): StoreInput[] {
   const content = fs.readFileSync(filePath, "utf-8");
   const lines = content.trim().split("\n");
@@ -97,118 +85,20 @@ function parseCSV(filePath: string): StoreInput[] {
 function writeCSV(filePath: string, rows: Record<string, string | boolean | null>[]): void {
   if (rows.length === 0) return;
   const headers = Object.keys(rows[0]);
-  const lines = [
-    headers.join(","),
-    ...rows.map((row) =>
-      headers
-        .map((h) => {
-          const v = row[h];
-          if (v === null || v === undefined) return "";
-          const s = String(v);
-          return s.includes(",") || s.includes('"') || s.includes("\n")
-            ? `"${s.replace(/"/g, '""')}"` : s;
-        })
-        .join(",")
-    ),
-  ];
+  const escape = (v: string | boolean | null) => {
+    if (v === null || v === undefined) return "";
+    const s = String(v);
+    return s.includes(",") || s.includes('"') || s.includes("\n")
+      ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [headers.join(","), ...rows.map((r) => headers.map((h) => escape(r[h])).join(","))];
   fs.writeFileSync(filePath, lines.join("\n"), "utf-8");
 }
 
-// ─── Claude AI Enrichment ────────────────────────────────────────────────────
-
-const SYSTEM_PROMPT = `Eres un asistente experto en geografía de Argentina y Uruguay, especializado en retail deportivo.
-Analizas nombres de sucursales y extraes información de ubicación con dos niveles geográficos:
-
-• localidad: barrio o localidad específica donde está la tienda.
-  - En CABA: barrio porteño (Flores, Recoleta, Belgrano, Caballito, Balvanera, Villa Crespo, Villa del Parque, Barrio Norte, Microcentro, etc.)
-  - En GBA: localidad dentro del partido (Monte Grande [Esteban Echeverría], Martínez [San Isidro], Grand Bourg [Malvinas Argentinas], Lavallol [Lomas de Zamora], Maquinista Savio [Escobar], Don Torcuato [Tigre], Trujui [Moreno], etc.)
-  - En ciudades del interior: puede coincidir con ciudad (ej: localidad "Mendoza" en ciudad "Mendoza")
-  - null si no se puede determinar
-
-• ciudad: municipio o ciudad principal.
-  - CABA siempre es "Buenos Aires" (ciudad autónoma)
-  - GBA: partido/municipio (Merlo, Moreno, San Isidro, Esteban Echeverría, Lomas de Zamora, La Matanza, Tigre, etc.)
-  - Interior: ciudad cabecera (Mendoza, Córdoba, Rosario, Tucumán, Salta, etc.)
-  - null si no se puede determinar
-
-Devuelve un array JSON. Cada objeto tiene:
-- sucursal: nombre exacto recibido (sin modificar)
-- pais: "AR" o "UY"
-- ciudad: municipio (ver arriba)
-- localidad: barrio/localidad (ver arriba). Puede ser igual a ciudad cuando coinciden.
-- provincia: provincia o departamento
-- codigo_postal: CP aproximado si es inferible, sino null
-- shopping: nombre del shopping si la tienda está dentro de uno, sino null
-- es_digital: true si contiene DIGITAL, MELI, MERCADOLIBRE, WEB, "On Line", .com
-- es_deposito: true si contiene DEPOSITO, Transito, Planta, Almacen
-
-SHOPPINGS CONOCIDOS (nombre → shopping / localidad / ciudad):
-ABASTO → Abasto Shopping / Balvanera / Buenos Aires
-UNICENTER → Unicenter / Martínez / San Isidro
-ALTO PALERMO → Alto Palermo Shopping / Palermo / Buenos Aires
-PASEO ALCORTA → Paseo Alcorta / Palermo / Buenos Aires
-GALERIAS PACIFICO → Galerías Pacífico / Retiro / Buenos Aires
-DOT → DOT Baires Shopping / Saavedra / Buenos Aires
-DEVOTO SHOPPING → Devoto Shopping / Villa del Parque / Buenos Aires
-ALTO AVELLANEDA → Alto Avellaneda Shopping / Avellaneda / Avellaneda
-SOLEIL → Shopping Soleil / Don Torcuato / Tigre
-TOM → Tortugas Open Mall / Nordelta / Tigre
-PALMAS DEL PILAR → Palmas del Pilar / Pilar / Pilar
-PLAZA OESTE → Shopping Plaza Oeste / Merlo / Merlo
-SAN JUSTO SHOPPING / FORLEDEN SAN JUSTO → Shopping San Justo / San Justo / La Matanza
-ALTO ROSARIO → Alto Rosario Shopping / Rosario / Rosario
-PORTAL ROSARIO → Portal Rosario / Rosario / Rosario
-SHOPPING DEL SIGLO → Shopping del Siglo / Rosario / Rosario
-NUEVO CENTRO (Córdoba) → Shopping Nuevo Centro / Córdoba / Córdoba
-PATIO OLMOS → Patio Olmos / Córdoba / Córdoba
-PORTAL TUCUMAN → Portal Tucumán / Tucumán / Tucumán
-PORTAL SALTA → Portal de Salta / Salta / Salta
-PORTAL SANTIAGO → Portal Santiago del Estero / Santiago del Estero / Santiago del Estero
-PORTAL NEUQUEN / IRSA NEUQUEN → Portal de Neuquén / Neuquén / Neuquén
-MENDOZA PLAZA → Mendoza Plaza Shopping / Mendoza / Mendoza
-PALMARES → Palmares Open Mall / Mendoza / Mendoza
-SAN LUIS SHOPPING → Shopping de San Luis / San Luis / San Luis
-PUNTA SHOPPING → Punta Shopping / Punta del Este / Punta del Este (UY)
-ATLANTICO SHOPPING → Atlántico Shopping / Montevideo / Montevideo (UY)
-MONTEVIDEO SHOPPING → Montevideo Shopping / Montevideo / Montevideo (UY)
-PORTONES → Portones Shopping / Montevideo / Montevideo (UY)
-PUNTA CARRETAS → Punta Carretas Shopping / Montevideo / Montevideo (UY)
-TRES CRUCES → Shopping Tres Cruces / Montevideo / Montevideo (UY)
-
-LOCALIDADES GBA clave:
-MAQ. SAVIO = Maquinista Savio → ciudad: Escobar
-GRAND BOURG / GRANG BOURG → ciudad: Malvinas Argentinas
-TORTUGUITAS → ciudad: Malvinas Argentinas
-BENAVIDEZ → ciudad: Tigre
-GARIN → ciudad: Escobar
-PTE. DERQUI → ciudad: Pilar
-VILLA LUZURIAGA → ciudad: La Matanza
-VIRREYES → ciudad: San Fernando
-LAFERRERE → ciudad: La Matanza
-TRUJUI → ciudad: Moreno
-MARIANO ACOSTA → ciudad: Moreno
-MONTE GRANDE → ciudad: Esteban Echeverría
-LAVALLOL → ciudad: Lomas de Zamora
-WILLIAM MORRIS → ciudad: Hurlingham
-PADUA → ciudad: Merlo
-CASTELAR → ciudad: Morón
-
-REGLAS:
-- MELI / MERCADOLIBRE / "On Line" → es_digital: true, ciudad: null, localidad: null, shopping: null
-- Cadenas UY: MACRI, KICKS, LA CANCHA, Jerome, NVS Tres Cruces, Nike.com UY, Sportline Atlántico/Punta Shopping → pais: "UY"
-- Tiendas con número de sucursal sin nombre de ciudad (ej: "All Sports 12", "Rossetti Deportes 17") → ciudad: null, localidad: null
-- Cuando localidad y ciudad son el mismo lugar (ej: tienda en el centro de Mendoza) → ambos campos con el mismo valor
-
-Devuelve SOLO el array JSON, sin markdown, sin explicaciones.`;
-
-async function enrichBatch(stores: StoreInput[]): Promise<StoreLocation[]> {
+// ─── Claude helper ────────────────────────────────────────────────────────────
+async function claudeCall(system: string, user: string, maxTokens = 8192): Promise<string> {
   if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
-
-  const userMessage = `Analiza estas ${stores.length} tiendas y devuelve el array JSON:\n\n${
-    stores.map((s, i) => `${i + 1}. ${s.sucursal}`).join("\n")
-  }`;
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -217,133 +107,239 @@ async function enrichBatch(stores: StoreInput[]): Promise<StoreLocation[]> {
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 8192,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userMessage }],
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: "user", content: user }],
     }),
   });
+  if (!res.ok) throw new Error(`Claude ${res.status}: ${await res.text()}`);
+  const data = (await res.json()) as { content: Array<{ type: string; text: string }> };
+  return data.content.find((c) => c.type === "text")?.text ?? "";
+}
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Claude API error ${response.status}: ${err}`);
+function extractJSON<T>(text: string): T {
+  const match = text.match(/[\[{][\s\S]*[\]}]/);
+  if (!match) throw new Error(`No JSON in: ${text.slice(0, 200)}`);
+  return JSON.parse(match[0]) as T;
+}
+
+// ─── Phase 1: Enriquecimiento de ubicación ────────────────────────────────────
+
+const ENRICH_SYSTEM = `Eres un asistente experto en geografía de Argentina y Uruguay, especializado en retail deportivo.
+Analizas nombres de sucursales y extraes información de ubicación con dos niveles:
+
+• localidad: barrio o localidad específica.
+  - CABA: barrio porteño (Flores, Recoleta, Belgrano, Caballito, Balvanera, Villa Crespo, Villa del Parque, Barrio Norte, Microcentro, Palermo, Retiro, Saavedra, etc.)
+  - GBA: localidad dentro del partido (Monte Grande→Esteban Echeverría, Martínez→San Isidro, Grand Bourg→Malvinas Argentinas, Lavallol→Lomas de Zamora, Maq. Savio→Escobar, Don Torcuato→Tigre, Trujui→Moreno, etc.)
+  - Interior: puede coincidir con ciudad (ej: "Mendoza" en ciudad "Mendoza")
+  - null si no se puede determinar
+
+• ciudad: municipio o ciudad principal.
+  - CABA → siempre "Buenos Aires"
+  - GBA: partido/municipio (Merlo, Moreno, San Isidro, Esteban Echeverría, Lomas de Zamora, La Matanza, Tigre, etc.)
+  - Interior: ciudad cabecera (Mendoza, Córdoba, Rosario, Tucumán, Salta, etc.)
+  - null si no se puede determinar
+
+Devuelve array JSON. Cada objeto:
+- sucursal: nombre exacto recibido (sin modificar)
+- pais: "AR" o "UY"
+- ciudad: municipio
+- localidad: barrio/localidad (puede ser igual a ciudad)
+- provincia: provincia o departamento
+- codigo_postal: CP aproximado si es inferible, sino null
+- shopping: nombre del shopping si está dentro de uno, sino null
+- es_digital: true si contiene DIGITAL, MELI, MERCADOLIBRE, WEB, "On Line", .com
+- es_deposito: true si contiene DEPOSITO, Transito, Planta, Almacen
+
+SHOPPINGS CONOCIDOS:
+ABASTO → Abasto Shopping | Balvanera | Buenos Aires
+UNICENTER → Unicenter | Martínez | San Isidro
+ALTO PALERMO → Alto Palermo Shopping | Palermo | Buenos Aires
+PASEO ALCORTA → Paseo Alcorta | Palermo | Buenos Aires
+GALERIAS PACIFICO → Galerías Pacífico | Retiro | Buenos Aires
+DOT → DOT Baires Shopping | Saavedra | Buenos Aires
+DEVOTO SHOPPING → Devoto Shopping | Villa del Parque | Buenos Aires
+ALTO AVELLANEDA → Alto Avellaneda Shopping | Avellaneda | Avellaneda
+SOLEIL → Shopping Soleil | Don Torcuato | Tigre
+TOM → Tortugas Open Mall | Nordelta | Tigre
+PALMAS DEL PILAR → Palmas del Pilar | Pilar | Pilar
+PLAZA OESTE → Shopping Plaza Oeste | Merlo | Merlo
+SAN JUSTO SHOPPING / FORLEDEN SAN JUSTO → Shopping San Justo | San Justo | La Matanza
+ALTO ROSARIO → Alto Rosario Shopping | Rosario | Rosario
+PORTAL ROSARIO → Portal Rosario | Rosario | Rosario
+SHOPPING DEL SIGLO → Shopping del Siglo | Rosario | Rosario
+NUEVO CENTRO (Córdoba) → Shopping Nuevo Centro | Córdoba | Córdoba
+PATIO OLMOS → Patio Olmos | Córdoba | Córdoba
+PORTAL TUCUMAN → Portal Tucumán | Tucumán | Tucumán
+PORTAL SALTA → Portal de Salta | Salta | Salta
+PORTAL SANTIAGO → Portal Santiago del Estero | Santiago del Estero | Santiago del Estero
+PORTAL NEUQUEN / IRSA NEUQUEN → Portal de Neuquén | Neuquén | Neuquén
+MENDOZA PLAZA → Mendoza Plaza Shopping | Mendoza | Mendoza
+PALMARES → Palmares Open Mall | Mendoza | Mendoza
+SAN LUIS SHOPPING → Shopping de San Luis | San Luis | San Luis
+PUNTA SHOPPING → Punta Shopping | Punta del Este | Punta del Este (UY)
+ATLANTICO SHOPPING → Atlántico Shopping | Montevideo | Montevideo (UY)
+MONTEVIDEO SHOPPING → Montevideo Shopping | Montevideo | Montevideo (UY)
+PORTONES → Portones Shopping | Montevideo | Montevideo (UY)
+PUNTA CARRETAS → Punta Carretas Shopping | Montevideo | Montevideo (UY)
+TRES CRUCES → Shopping Tres Cruces | Montevideo | Montevideo (UY)
+
+LOCALIDADES GBA:
+MAQ. SAVIO = Maquinista Savio → Escobar | GRAND BOURG / GRANG BOURG → Malvinas Argentinas
+TORTUGUITAS → Malvinas Argentinas | BENAVIDEZ → Tigre | GARIN → Escobar
+PTE. DERQUI → Pilar | VILLA LUZURIAGA → La Matanza | VIRREYES → San Fernando
+LAFERRERE → La Matanza | TRUJUI → Moreno | MARIANO ACOSTA → Moreno
+MONTE GRANDE → Esteban Echeverría | LAVALLOL → Lomas de Zamora
+WILLIAM MORRIS → Hurlingham | PADUA → Merlo | CASTELAR → Morón
+
+REGLAS:
+- MELI / MERCADOLIBRE / "On Line" → es_digital:true, ciudad:null, localidad:null, shopping:null
+- Cadenas UY: MACRI, KICKS, LA CANCHA, Jerome, NVS Tres Cruces, Nike.com UY, Sportline Atlántico/Punta → pais:"UY"
+- Tiendas con número sin ciudad (ej: "All Sports 12", "Rossetti Deportes 17") → ciudad:null, localidad:null
+- localidad igual a ciudad cuando coinciden (interior sin barrio específico)
+
+Devuelve SOLO el array JSON, sin markdown.`;
+
+async function enrichBatch(stores: StoreInput[]): Promise<StoreLocation[]> {
+  const text = await claudeCall(
+    ENRICH_SYSTEM,
+    `Analiza estas ${stores.length} tiendas:\n\n${stores.map((s, i) => `${i + 1}. ${s.sucursal}`).join("\n")}`
+  );
+  return extractJSON<StoreLocation[]>(text);
+}
+
+// ─── Phase 2: Verificación de Adidas/Puma con Claude ─────────────────────────
+
+const V2_SYSTEM = `Eres un experto en presencia retail de marcas deportivas en Argentina y Uruguay.
+Tu tarea es verificar si Adidas y Puma tienen tiendas PROPIAS (monobrand, locales de la marca) en las ubicaciones indicadas.
+
+Se te pasa un array de ubicaciones con un campo "tipo":
+- "shopping": ¿hay una tienda propia de Adidas/Puma DENTRO de ese shopping center?
+- "localidad": ¿hay una tienda propia de Adidas/Puma en esa localidad/barrio?
+- "ciudad": ¿hay una tienda propia de Adidas/Puma en esa ciudad/municipio?
+
+Responde SOLO tiendas propias (monobrand). NO cuentes:
+- Multimarcas que venden esa marca (Solo Deportes, Sportline, etc.)
+- Outlets o tiendas de terceros
+- Solo las tiendas oficiales de la marca (Adidas Store, Puma Store, Adidas Originals, etc.)
+
+Devuelve un array JSON con exactamente los mismos "key" recibidos:
+[{ "key": "...", "adidas": true/false, "puma": true/false }, ...]
+
+Basate en tu conocimiento real de la presencia retail de estas marcas. Si no estás seguro, pon false.
+Devuelve SOLO el array JSON, sin markdown.`;
+
+interface LocationQuery {
+  key: string;
+  tipo: "shopping" | "localidad" | "ciudad";
+  nombre: string;
+  ciudad?: string;
+  pais: string;
+}
+
+interface BrandPresence { key: string; adidas: boolean; puma: boolean }
+
+// Cache: evita llamar Claude dos veces por la misma ubicación
+const presenceCache = new Map<string, { adidas: boolean; puma: boolean }>();
+
+async function checkPresenceBatch(queries: LocationQuery[]): Promise<void> {
+  // Filter out already-cached
+  const needed = queries.filter((q) => !presenceCache.has(q.key));
+  if (needed.length === 0) return;
+
+  const text = await claudeCall(
+    V2_SYSTEM,
+    `Verificá la presencia de Adidas y Puma en estas ${needed.length} ubicaciones:\n${JSON.stringify(needed, null, 2)}`,
+    4096
+  );
+
+  const results = extractJSON<BrandPresence[]>(text);
+  for (const r of results) {
+    presenceCache.set(r.key, { adidas: r.adidas, puma: r.puma });
   }
-
-  const data = (await response.json()) as { content: Array<{ type: string; text: string }> };
-  const text = data.content.find((c) => c.type === "text")?.text ?? "";
-  const jsonMatch = text.match(/\[[\s\S]*\]/);
-  if (!jsonMatch) throw new Error(`No JSON in response: ${text.slice(0, 300)}`);
-  return JSON.parse(jsonMatch[0]) as StoreLocation[];
 }
 
-// ─── Google Maps V2 ──────────────────────────────────────────────────────────
+function buildLocationQueries(locations: StoreLocation[]): LocationQuery[] {
+  const seen = new Set<string>();
+  const queries: LocationQuery[] = [];
 
-interface Coords { lat: number; lng: number }
+  for (const loc of locations) {
+    if (loc.es_digital || loc.es_deposito) continue;
+    const pais = loc.pais;
+    const ciudad = loc.ciudad ?? "";
 
-// Cache geocoding results to avoid duplicate API calls
-const geocodeCache = new Map<string, Coords | null>();
-
-async function geocode(query: string): Promise<Coords | null> {
-  if (geocodeCache.has(query)) return geocodeCache.get(query)!;
-  const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&key=${GOOGLE_MAPS_API_KEY}`;
-  const res = await fetch(url);
-  const data = (await res.json()) as {
-    status: string;
-    results: Array<{ geometry: { location: Coords } }>;
-  };
-  const result = data.status === "OK" && data.results.length
-    ? data.results[0].geometry.location
-    : null;
-  geocodeCache.set(query, result);
-  return result;
+    if (loc.shopping && ciudad) {
+      const key = `shopping:${loc.shopping}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        queries.push({ key, tipo: "shopping", nombre: loc.shopping, ciudad, pais });
+      }
+    }
+    if (loc.localidad && ciudad && loc.localidad !== loc.ciudad) {
+      const key = `localidad:${loc.localidad}:${ciudad}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        queries.push({ key, tipo: "localidad", nombre: loc.localidad, ciudad, pais });
+      }
+    }
+    if (loc.ciudad) {
+      const key = `ciudad:${loc.ciudad}:${pais}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        queries.push({ key, tipo: "ciudad", nombre: loc.ciudad, pais });
+      }
+    }
+  }
+  return queries;
 }
 
-async function hasBrandNearby(lat: number, lng: number, brand: string, radius: number): Promise<boolean> {
-  const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=${radius}&keyword=${encodeURIComponent(brand + " tienda")}&key=${GOOGLE_MAPS_API_KEY}`;
-  const res = await fetch(url);
-  const data = (await res.json()) as { status: string; results: unknown[] };
-  return data.status === "OK" && data.results.length > 0;
-}
-
-async function checkBrandAtCoords(coords: Coords | null, radius: number): Promise<{ adidas: boolean | null; puma: boolean | null }> {
-  if (!coords) return { adidas: null, puma: null };
-  const [adidas, puma] = await Promise.all([
-    hasBrandNearby(coords.lat, coords.lng, "Adidas", radius),
-    hasBrandNearby(coords.lat, coords.lng, "Puma", radius),
-  ]);
-  return { adidas, puma };
-}
-
-async function checkCompetitors(loc: StoreLocation): Promise<CompetitorFlags> {
+function getFlags(loc: StoreLocation): CompetitorFlags {
   const nullFlags: CompetitorFlags = {
     ADI_shopping: null, ADI_localidad: null, ADI_ciudad: null,
     PUM_shopping: null, PUM_localidad: null, PUM_ciudad: null,
   };
-
   if (loc.es_digital || loc.es_deposito) return nullFlags;
 
-  const country = loc.pais === "UY" ? "Uruguay" : "Argentina";
-  const province = loc.provincia ?? country;
+  const ciudad = loc.ciudad ?? "";
 
-  // ── Shopping level (500 m) ───────────────────────────────────────────────
-  let shoppingFlags = { adidas: null as boolean | null, puma: null as boolean | null };
-  if (loc.shopping && loc.ciudad) {
-    const shoppingCoords = await geocode(`${loc.shopping}, ${loc.ciudad}, ${province}, ${country}`);
-    shoppingFlags = await checkBrandAtCoords(shoppingCoords, RADIUS_SHOPPING);
-  }
+  const shoppingResult = loc.shopping && ciudad
+    ? presenceCache.get(`shopping:${loc.shopping}`) : undefined;
 
-  // ── Localidad level (2500 m) ─────────────────────────────────────────────
-  let localidadFlags = { adidas: null as boolean | null, puma: null as boolean | null };
-  if (loc.localidad && loc.ciudad) {
-    // If localidad === ciudad, we'll reuse ciudad result (skip separate geocode)
-    if (loc.localidad === loc.ciudad) {
-      // Will be set after ciudad computation below — placeholder
-      localidadFlags = { adidas: null, puma: null }; // filled after
-    } else {
-      const localidadCoords = await geocode(`${loc.localidad}, ${loc.ciudad}, ${province}, ${country}`);
-      localidadFlags = await checkBrandAtCoords(localidadCoords, RADIUS_LOCALIDAD);
-    }
-  }
+  // If localidad === ciudad, they share the same cache entry
+  const localidadKey = loc.localidad && ciudad
+    ? (loc.localidad === loc.ciudad
+        ? `ciudad:${loc.ciudad}:${loc.pais}`
+        : `localidad:${loc.localidad}:${ciudad}`)
+    : undefined;
+  const localidadResult = localidadKey ? presenceCache.get(localidadKey) : undefined;
 
-  // ── Ciudad level (8000 m) ────────────────────────────────────────────────
-  let ciudadFlags = { adidas: null as boolean | null, puma: null as boolean | null };
-  if (loc.ciudad) {
-    const ciudadCoords = await geocode(`${loc.ciudad}, ${province}, ${country}`);
-    ciudadFlags = await checkBrandAtCoords(ciudadCoords, RADIUS_CIUDAD);
-
-    // If localidad === ciudad, reuse ciudad result (avoids redundant API call)
-    if (loc.localidad === loc.ciudad) {
-      localidadFlags = ciudadFlags;
-    }
-  }
+  const ciudadResult = loc.ciudad
+    ? presenceCache.get(`ciudad:${loc.ciudad}:${loc.pais}`) : undefined;
 
   return {
-    ADI_shopping:  loc.shopping ? shoppingFlags.adidas  : null,
-    ADI_localidad: loc.localidad ? localidadFlags.adidas : null,
-    ADI_ciudad:    loc.ciudad    ? ciudadFlags.adidas    : null,
-    PUM_shopping:  loc.shopping ? shoppingFlags.puma    : null,
-    PUM_localidad: loc.localidad ? localidadFlags.puma   : null,
-    PUM_ciudad:    loc.ciudad    ? ciudadFlags.puma      : null,
+    ADI_shopping:  loc.shopping    ? (shoppingResult?.adidas  ?? null) : null,
+    ADI_localidad: loc.localidad   ? (localidadResult?.adidas ?? null) : null,
+    ADI_ciudad:    loc.ciudad      ? (ciudadResult?.adidas    ?? null) : null,
+    PUM_shopping:  loc.shopping    ? (shoppingResult?.puma    ?? null) : null,
+    PUM_localidad: loc.localidad   ? (localidadResult?.puma   ?? null) : null,
+    PUM_ciudad:    loc.ciudad      ? (ciudadResult?.puma      ?? null) : null,
   };
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
-
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   if (!ANTHROPIC_API_KEY) {
-    console.error("ERROR: ANTHROPIC_API_KEY not set (check .env.local)");
-    process.exit(1);
-  }
-  if (IS_V2 && !GOOGLE_MAPS_API_KEY) {
-    console.error("ERROR: --v2 requires GOOGLE_MAPS_API_KEY in .env.local");
+    console.error("ERROR: ANTHROPIC_API_KEY no encontrada (revisá .env.local)");
     process.exit(1);
   }
 
-  console.log(`Mode: V${IS_V2 ? "2 (AI + Google Maps)" : "1 (AI only)"}`);
-  console.log(`Reading: ${INPUT_CSV}`);
+  console.log(`Modo: V${IS_V2 ? "2 — Claude AI (ubicación + presencia Adidas/Puma)" : "1 — Claude AI (ubicación)"}`);
+  console.log(`Input: ${INPUT_CSV}\n`);
+
   const stores = parseCSV(INPUT_CSV);
-  console.log(`Loaded ${stores.length} stores. Batch size: ${BATCH_SIZE}\n`);
+  console.log(`${stores.length} tiendas cargadas. Batch size: ${BATCH_SIZE}`);
 
   const metaMap = new Map<string, { canal: string; cliente: string }>();
   for (const s of stores) metaMap.set(s.sucursal, { canal: s.canal, cliente: s.cliente });
@@ -351,41 +347,57 @@ async function main() {
   const batches: StoreInput[][] = [];
   for (let i = 0; i < stores.length; i += BATCH_SIZE) batches.push(stores.slice(i, i + BATCH_SIZE));
 
+  // ── Phase 1: Claude enriquece ubicaciones ───────────────────────────────────
+  console.log(`\n── Phase 1: Enriquecimiento de ubicación (${batches.length} batches) ──`);
   const allLocations: StoreLocation[] = [];
+  const fallback = (s: StoreInput): StoreLocation => ({
+    sucursal: s.sucursal, pais: "AR", ciudad: null, localidad: null,
+    provincia: null, codigo_postal: null, shopping: null, es_digital: false, es_deposito: false,
+  });
 
-  // ── Phase 1: Claude AI enrichment ─────────────────────────────────────────
   for (let b = 0; b < batches.length; b++) {
     const batch = batches[b];
-    process.stdout.write(`Batch ${b + 1}/${batches.length} (${batch.length} stores) ... `);
-
-    let locations: StoreLocation[];
+    process.stdout.write(`  Batch ${b + 1}/${batches.length} (${batch.length} tiendas)... `);
     try {
-      locations = await enrichBatch(batch);
-      // Ensure all stores in batch are represented (Claude might skip some)
-      const returned = new Set(locations.map((l) => l.sucursal));
-      for (const s of batch) {
-        if (!returned.has(s.sucursal)) {
-          locations.push({ sucursal: s.sucursal, pais: "AR", ciudad: null, localidad: null, provincia: null, codigo_postal: null, shopping: null, es_digital: false, es_deposito: false });
-        }
-      }
+      const locs = await enrichBatch(batch);
+      const returned = new Set(locs.map((l) => l.sucursal));
+      for (const s of batch) if (!returned.has(s.sucursal)) locs.push(fallback(s));
+      allLocations.push(...locs);
       console.log("OK");
     } catch (err) {
-      console.log(`FAILED: ${err}`);
-      locations = batch.map((s) => ({ sucursal: s.sucursal, pais: "AR", ciudad: null, localidad: null, provincia: null, codigo_postal: null, shopping: null, es_digital: false, es_deposito: false }));
+      console.log(`ERROR: ${err}`);
+      allLocations.push(...batch.map(fallback));
     }
-
-    allLocations.push(...locations);
     if (b < batches.length - 1) await sleep(DELAY_MS);
   }
+  console.log(`  → ${allLocations.length} tiendas procesadas.`);
 
-  console.log(`\nAI enrichment done. ${allLocations.length} stores processed.`);
+  // ── Phase 2: Claude verifica Adidas/Puma por ubicación única ───────────────
+  if (IS_V2) {
+    const queries = buildLocationQueries(allLocations);
+    console.log(`\n── Phase 2: Verificación Adidas/Puma (${queries.length} ubicaciones únicas) ──`);
 
-  // ── Phase 2: Google Maps V2 ───────────────────────────────────────────────
+    const v2Batches: LocationQuery[][] = [];
+    for (let i = 0; i < queries.length; i += V2_BATCH_SIZE) v2Batches.push(queries.slice(i, i + V2_BATCH_SIZE));
+
+    for (let b = 0; b < v2Batches.length; b++) {
+      process.stdout.write(`  Batch ${b + 1}/${v2Batches.length} (${v2Batches[b].length} ubicaciones)... `);
+      try {
+        await checkPresenceBatch(v2Batches[b]);
+        console.log("OK");
+      } catch (err) {
+        console.log(`ERROR: ${err}`);
+      }
+      if (b < v2Batches.length - 1) await sleep(DELAY_MS);
+    }
+    console.log(`  → ${presenceCache.size} ubicaciones verificadas.`);
+  }
+
+  // ── Build output rows ────────────────────────────────────────────────────────
   const rows: Record<string, string | boolean | null>[] = [];
-
   for (const loc of allLocations) {
     const meta = metaMap.get(loc.sucursal) ?? { canal: "", cliente: "" };
-    const base: Record<string, string | boolean | null> = {
+    const row: Record<string, string | boolean | null> = {
       sucursal:      loc.sucursal,
       canal:         meta.canal,
       cliente:       meta.cliente,
@@ -398,35 +410,28 @@ async function main() {
       es_digital:    loc.es_digital,
       es_deposito:   loc.es_deposito,
     };
-
-    if (IS_V2) {
-      const flags = await checkCompetitors(loc);
-      Object.assign(base, flags);
-      const tag = loc.shopping ? `[shopping] ` : loc.localidad ? `[${loc.localidad}] ` : "";
-      console.log(`  ${loc.sucursal} → ${tag}${loc.ciudad ?? "?"} | ADI:${flags.ADI_ciudad} PUM:${flags.PUM_ciudad}`);
-    }
-
-    rows.push(base);
+    if (IS_V2) Object.assign(row, getFlags(loc));
+    rows.push(row);
   }
 
   writeCSV(OUTPUT_CSV, rows);
-  console.log(`\nWritten: ${OUTPUT_CSV}`);
-  console.log(`Total rows: ${rows.length}`);
 
-  // Stats
+  // ── Stats ────────────────────────────────────────────────────────────────────
   const physical = rows.filter((r) => !r.es_digital && !r.es_deposito);
-  console.log(`\n── Stats ──────────────────────────────────`);
-  console.log(`  Total stores:      ${rows.length}`);
-  console.log(`  Physical:          ${physical.length}`);
-  console.log(`  With ciudad:       ${physical.filter((r) => r.ciudad).length}`);
-  console.log(`  With localidad:    ${physical.filter((r) => r.localidad).length}`);
-  console.log(`  In shopping:       ${physical.filter((r) => r.shopping).length}`);
-  console.log(`  Digital:           ${rows.filter((r) => r.es_digital).length}`);
-  console.log(`  Depósito:          ${rows.filter((r) => r.es_deposito).length}`);
+  console.log(`\n── Resultado ────────────────────────────────`);
+  console.log(`  Output: ${OUTPUT_CSV}`);
+  console.log(`  Total:          ${rows.length}`);
+  console.log(`  Físicas:        ${physical.length}`);
+  console.log(`  Con ciudad:     ${physical.filter((r) => r.ciudad).length}`);
+  console.log(`  Con localidad:  ${physical.filter((r) => r.localidad).length}`);
+  console.log(`  En shopping:    ${physical.filter((r) => r.shopping).length}`);
+  console.log(`  Digital:        ${rows.filter((r) => r.es_digital).length}`);
+  console.log(`  Depósito:       ${rows.filter((r) => r.es_deposito).length}`);
   if (IS_V2) {
-    console.log(`  ADI city-level:    ${rows.filter((r) => r.ADI_ciudad === true).length} stores with Adidas nearby`);
-    console.log(`  PUM city-level:    ${rows.filter((r) => r.PUM_ciudad === true).length} stores with Puma nearby`);
-    console.log(`  Geocode cache hits: ${geocodeCache.size} unique locations resolved`);
+    console.log(`  ADI en ciudad:  ${rows.filter((r) => r.ADI_ciudad === true).length} tiendas con Adidas en esa ciudad`);
+    console.log(`  PUM en ciudad:  ${rows.filter((r) => r.PUM_ciudad === true).length} tiendas con Puma en esa ciudad`);
+    console.log(`  ADI en shopping:${rows.filter((r) => r.ADI_shopping === true).length} tiendas con Adidas en ese shopping`);
+    console.log(`  PUM en shopping:${rows.filter((r) => r.PUM_shopping === true).length} tiendas con Puma en ese shopping`);
   }
 }
 
